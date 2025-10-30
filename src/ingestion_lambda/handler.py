@@ -35,6 +35,8 @@ DB_NAME = os.environ.get('DB_NAME')
 DB_USER = os.environ.get('DB_USER')
 DB_PASSWORD = os.environ.get('DB_PASSWORD')
 DB_PATH = os.environ.get('DB_PATH')
+DB_S3_BUCKET = os.environ.get('DB_S3_BUCKET')
+DB_S3_KEY = os.environ.get('DB_S3_KEY')
 RAW_BUCKET = os.environ.get('RAW_BUCKET', os.environ.get('RAW_S3_BUCKET', ''))
 DB_S3_BUCKET = os.environ.get('DB_S3_BUCKET', '')
 DB_S3_KEY = os.environ.get('DB_S3_KEY', '')
@@ -51,12 +53,18 @@ def query_db(query, params=None, fetch_size=1000):
       - SQLite via sqlite3 when DB_TYPE=sqlite and DB_PATH is set
     """
     if DB_TYPE == 'sqlite':
-        if not DB_PATH:
-            raise RuntimeError('DB_PATH must be set for sqlite DB_TYPE')
+        # Work with a local variable here to avoid UnboundLocalError when
+        # assigning; support either a direct DB_PATH or separate S3 bucket/key variables
+        db_path = DB_PATH
+        if not db_path:
+            if DB_S3_BUCKET and DB_S3_KEY:
+                db_path = f's3://{DB_S3_BUCKET}/{DB_S3_KEY}'
+            else:
+                raise RuntimeError('DB_PATH must be set for sqlite DB_TYPE (or set DB_S3_BUCKET and DB_S3_KEY)')
 
-        # If DB_PATH is an S3 URI, download it to /tmp so sqlite3 can open it.
-        local_path = DB_PATH
-        if DB_PATH.startswith('s3://'):
+        # If db_path is an S3 URI, download it to /tmp so sqlite3 can open it.
+        local_path = db_path
+        if db_path.startswith('s3://'):
             # parse s3://bucket/key
             try:
                 import boto3
@@ -64,7 +72,7 @@ def query_db(query, params=None, fetch_size=1000):
                 raise RuntimeError('boto3 is required to download DB from S3')
 
             s3 = boto3.client('s3')
-            parts = DB_PATH[5:].split('/', 1)
+            parts = db_path[5:].split('/', 1)
             if len(parts) != 2:
                 raise RuntimeError('Invalid S3 path for DB_PATH')
             bucket, key = parts
@@ -74,7 +82,7 @@ def query_db(query, params=None, fetch_size=1000):
                 s3.download_file(bucket, key, tmp_local)
             except Exception as e:
                 # Provide helpful error
-                raise RuntimeError(f'Failed to download DB from S3 {DB_PATH}: {e}')
+                raise RuntimeError(f'Failed to download DB from S3 {db_path}: {e}')
             local_path = tmp_local
         conn = None
         try:

@@ -106,6 +106,9 @@ module "processing_lambda" {
   events        = ["s3:ObjectCreated:*"]
   filter_prefix = "raw/"
   filter_suffix = ".json"
+  # Use EventBridge to route S3 events to this lambda
+  invoke_principal   = "events.amazonaws.com"
+  invoke_source_arn  = aws_cloudwatch_event_rule.raw_to_processing.arn
   environment = {
     RAW_BUCKET = aws_s3_bucket.raw_data.bucket
     PROCESSED_BUCKET = aws_s3_bucket.processed_data.bucket
@@ -130,8 +133,66 @@ module "analytics_lambda" {
   events        = ["s3:ObjectCreated:*"]
   filter_prefix = "processed/"
   filter_suffix = ".json"
+  # Use EventBridge to route S3 events to this lambda
+  invoke_principal   = "events.amazonaws.com"
+  invoke_source_arn  = aws_cloudwatch_event_rule.processed_to_analytics.arn
   environment = {
     ANALYTICS_BUCKET = aws_s3_bucket.analytics_data.bucket
+  }
+}
+
+# EventBridge rules to route S3 object-created events into the two lambdas.
+resource "aws_cloudwatch_event_rule" "raw_to_processing" {
+  name = "${var.prefix}-raw-to-processing"
+  event_pattern = jsonencode({
+    source = ["aws.s3"],
+    "detail-type" = ["Object Created"],
+    detail = {
+      bucket = { name = [aws_s3_bucket.raw_data.bucket] },
+      object = { key = [{ prefix = "raw/" }] }
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "to_processing" {
+  rule = aws_cloudwatch_event_rule.raw_to_processing.name
+  arn  = module.processing_lambda.lambda_arn
+
+  input_transformer {
+    input_paths = {
+      bucket = "$.detail.bucket.name"
+      key    = "$.detail.object.key"
+    }
+    input_template = <<TEMPLATE
+{"Records":[{"s3":{"bucket":{"name":"<bucket>"},"object":{"key":"<key>"}}}]}
+TEMPLATE
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "processed_to_analytics" {
+  name = "${var.prefix}-processed-to-analytics"
+  event_pattern = jsonencode({
+    source = ["aws.s3"],
+    "detail-type" = ["Object Created"],
+    detail = {
+      bucket = { name = [aws_s3_bucket.processed_data.bucket] },
+      object = { key = [{ prefix = "processed/" }] }
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "to_analytics" {
+  rule = aws_cloudwatch_event_rule.processed_to_analytics.name
+  arn  = module.analytics_lambda.lambda_arn
+
+  input_transformer {
+    input_paths = {
+      bucket = "$.detail.bucket.name"
+      key    = "$.detail.object.key"
+    }
+    input_template = <<TEMPLATE
+{"Records":[{"s3":{"bucket":{"name":"<bucket>"},"object":{"key":"<key>"}}}]}
+TEMPLATE
   }
 }
 

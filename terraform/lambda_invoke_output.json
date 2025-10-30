@@ -1,0 +1,1 @@
+{"status": "error", "message": "cannot access local variable 'DB_PATH' where it is not associated with a value"}

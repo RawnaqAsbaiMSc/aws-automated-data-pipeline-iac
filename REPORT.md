@@ -1,3 +1,190 @@
+## Session Report — Automated Data Pipeline (trimmed)
+
+This document records the actionable changes made during the session, the architecture and workflow of the pipeline as configured in this repository, verification steps that were performed, and next steps to finalize the deployment.
+
+Date: 2025-10-30
+
+## Goals
+- Provision an S3-based automated data pipeline using Terraform.
+- Provide Lambdas for ingestion -> processing -> analytics with a shared Lambda Layer for DB drivers.
+- Wire S3 events reliably so multiple Lambdas can receive the same events (avoid notification clobbering).
+- Use a public dataset (Chinook SQLite DB) to drive the pipeline and validate end-to-end behavior.
+- Document everything and provide the commands to reproduce and finish deployment.
+
+## High-level changes applied
+
+- Installed and used Terraform in the dev container to manage AWS resources (init/plan/apply cycles were executed during the session).
+- Cleaned and fixed Terraform modules so `terraform init` and subsequent plans succeed.
+- Ensured S3 bucket names are unique by appending a `random_id` suffix in `terraform/main.tf`.
+- Reworked the Lambda module to stop creating per-module `aws_s3_bucket_notification` resources (these overwrite a bucket's notification configuration when multiple modules are used).
+- Introduced EventBridge (CloudWatch Events) rules and targets in the root `terraform/main.tf` to route S3 ObjectCreated events (for `raw/` and `processed/` prefixes) to the processing and analytics Lambdas respectively.
+- Made lambda permission configurable via module inputs (`invoke_principal`, `invoke_source_arn`) to support EventBridge-based invocations.
+- Patched `src/ingestion_lambda/handler.py` to fix a local-variable assignment bug and to support downloading a SQLite DB from S3 (support for DB_S3_BUCKET/DB_S3_KEY). This fixed the UnboundLocalError and enabled the ingestion Lambda to read `db/chinook.db` uploaded to S3.
+- Packaged updated Lambda zip(s) under `build/` and used Terraform to update the function code and permissions where possible.
+- Downloaded a public Chinook SQLite DB from GitHub and uploaded it to the raw bucket at `db/chinook.db` to drive ingestion tests.
+
+## Files changed (summary)
+- terraform/main.tf — Added EventBridge rules/targets and passed `invoke_principal`/`invoke_source_arn` into the lambda modules. Added `random_id`-based suffix for buckets (already present during earlier steps).
+- terraform/modules/lambda/main.tf — Removed per-module `aws_s3_bucket_notification` and made `aws_lambda_permission` configurable (variable-driven principal/source_arn).
+- terraform/modules/lambda/variables.tf — Added variables `invoke_principal` and `invoke_source_arn`.
+- src/ingestion_lambda/handler.py — Fixed DB path handling (use `db_path` local variable to avoid UnboundLocalError), added support for DB download from S3 and fallback to DB_S3_BUCKET/DB_S3_KEY.
+- build/ingestion_function.zip — Rebuilt (packaged updated handler). (Binary artifact)
+
+Full edits (for reference)
+- See the commits and terraform plan output in the Terraform run logs for exact diffs. The most important logical changes were:
+  - per-module S3 notifications removed
+  - EventBridge rules/targets added at root
+  - lambda permission now uses `events.amazonaws.com` where EventBridge targets call the lambda
+
+## Architecture (concise)
+
+The pipeline is organized into three logical stages backed by S3 buckets:
+
+- raw bucket: receives raw payloads produced by the ingestion Lambda (and also stores the Chinook DB as `db/chinook.db`).
+- processed bucket: stores transformed payloads produced by the processing Lambda.
+- analytics bucket: stores aggregated analytics/summary JSON produced by the analytics Lambda.
+
+Processing logic (Lambda code summary):
+- Ingestion Lambda (`src/ingestion_lambda/handler.py`)
+  - DB_TYPE=sqlite (configured via Terraform environment)
+  - Downloads the SQLite DB from `s3://<raw_bucket>/db/chinook.db` to `/tmp` and runs a query (configurable via `INGEST_QUERY`) to retrieve rows.
+  - Uploads a JSON payload to `s3://<raw_bucket>/raw/<timestamp>/<uuid>.json` containing `fetched_at`, `row_count`, and `rows`.
+
+- Processing Lambda (`src/processing_lambda/handler.py`)
+  - Triggered by S3 events for new objects under `raw/` (via EventBridge in the new setup).
+  - Loads the raw payload, selects/renames fields (track_id, track_name, album_title, composer, milliseconds, unit_price), writes a processed JSON under `processed/` and writes an analytics summary (`analytics/..._summary.json`) to the analytics bucket.
+
+- Analytics Lambda (`src/analytics_lambda/handler.py`)
+  - Placeholder minimal function; in this session it was prepared to receive `processed/` object-created events via EventBridge and could run further aggregation/workflows.
+
+### Architecture diagram (ASCII)
+
+raw S3 bucket                processed S3 bucket               analytics S3 bucket
+--------------               -------------------               -------------------
+  (stores db)                      |                                    |
+   db/chinook.db                    |                                    |
+         |                         PUT processed/                         |
+         |                              |                                 |
+         v                              v                                 v
+[ingestion Lambda] --PUT--> s3://raw/raw/...json  --EventBridge--> [processing Lambda] --PUT--> s3://processed/...
+       | (reads DB)                            (EventBridge rule: raw->processing)    | (writes processed)
+       |                                                                              v
+       |                                                                         [analytics Lambda]
+       | (optional direct invocation for tests)                                      |
+       v                                                                                v
+  (invoker: operator)                                                            s3://analytics/...summary.json
+
+Notes:
+- S3 -> Lambda fan-out: originally attempted with S3 bucket notifications per-module, which overwrote the bucket notification when multiple modules each defined a `aws_s3_bucket_notification`. To fix this, I switched to EventBridge rules and targets created at the root Terraform module and changed the module permission to allow `events.amazonaws.com` to invoke the target Lambda.
+
+## Workflow (sequence)
+1. A DB is available in `s3://<raw_bucket>/db/chinook.db` (we uploaded a public Chinook DB to this path).
+2. The ingestion Lambda is invoked (manual or scheduled). It downloads the DB, runs `INGEST_QUERY` and writes a JSON file to `s3://<raw_bucket>/raw/<timestamp>/<uuid>.json`.
+3. S3 emits an ObjectCreated event which EventBridge matches with `raw_to_processing` rule.
+4. EventBridge target transforms the event into a small S3-style `Records` object and invokes the processing Lambda.
+5. Processing Lambda reads the raw payload, transforms rows, writes processed JSON to `s3://<processed_bucket>/processed/...` and writes an analytics summary to `s3://<analytics_bucket>/analytics/...`.
+6. EventBridge similarly routes `processed/` object-created events to the analytics Lambda (if the analytics Lambda performs additional aggregations or notifications).
+
+## Verification performed here
+
+- I downloaded the Chinook SQLite DB from GitHub and uploaded it to: `s3://my-pipeline-raw-data-bdbdeadb/db/chinook.db`.
+- I patched and packaged the ingestion Lambda and applied Terraform changes to update the function code where AWS credentials allowed the operation.
+- I invoked the ingestion Lambda from the CLI; the function returned:
+
+```
+{ "status": "ok", "s3_path": "s3://my-pipeline-raw-data-bdbdeadb/raw/2025-10-28T17-32-55Z/<uuid>.json", "row_count": 500 }
+```
+
+- After ingestion produced a raw JSON, EventBridge rules were created in Terraform. However, a final `terraform apply` to fully provision EventBridge resources and permissions failed in this environment because the AWS credentials used here became invalid/expired (STS GetCallerIdentity returned InvalidClientTokenId). This prevented the final apply and live verification of EventBridge->Lambda fan-out in your AWS account from this session.
+
+Locally reproducible checks (worked during session)
+- Local `src/ingestion_lambda/local_run.py` tests reading `data/chinook.db` returned a successful local ingest (wrote JSON to `build/local_uploads/`).
+- Lambda invocation (CLI) confirmed ingestion produced raw JSON objects in the raw bucket.
+
+## How to finish deployment (actions you can run now)
+
+1) Ensure the environment has valid AWS credentials accessible to Terraform (environment variables, `aws configure`, SSO login, or otherwise). Verify:
+
+```bash
+aws sts get-caller-identity
+```
+
+2) From the repo root, create the function zip(s) (already done in session but re-run if you changed code):
+
+```bash
+cd /workspaces/aws-automated-data-pipeline-iac
+# package ingestion (and other lambdas if changed)
+zip -j build/ingestion_function.zip src/ingestion_lambda/handler.py
+zip -j build/processing_function.zip src/processing_lambda/handler.py
+zip -j build/analytics_function.zip src/analytics_lambda/handler.py
+```
+
+3) Apply Terraform to create EventBridge rules & permissions (this step requires valid AWS credentials):
+
+```bash
+cd terraform
+terraform init
+terraform plan -out=tfplan -input=false
+terraform apply -input=false -auto-approve tfplan
+```
+
+4) Trigger ingestion (manual test):
+
+```bash
+# invoke ingestion Lambda
+aws lambda invoke --function-name <ingestion-function-name> --payload '{}' /tmp/ingest_out.json --cli-binary-format raw-in-base64-out
+cat /tmp/ingest_out.json
+
+# or upload a copy of an existing raw object to create an ObjectCreated event
+aws s3 cp s3://<raw_bucket>/raw/<existing-file> s3://<raw_bucket>/raw/test-trigger-$(date +%s).json
+```
+
+5) Verify processing and analytics outputs
+
+```bash
+aws s3 ls s3://<processed_bucket> --recursive
+aws s3 ls s3://<analytics_bucket> --recursive
+```
+
+6) If EventBridge is active and the lambdas have the `events.amazonaws.com` permission and target was created, the processing lambda will be invoked automatically and analytics JSON should appear.
+
+## Sample transformation (what ends up in analytics)
+
+- From Chinook Track rows the processing Lambda selects:
+  - track_id, track_name, album_title, composer, milliseconds, unit_price
+- The analytics artifact is a small JSON summary mapping album_title -> count (album_counts) and a pointer to the processed object.
+
+Example `analytics/..._summary.json` (representative):
+
+```json
+{
+  "generated_from": "s3://my-pipeline-raw-data-bdbdeadb/raw/2025-10-28T17-32-55Z/<uuid>.json",
+  "album_counts": { "For Those About To Rock (We Salute You)": 5, "Back In Black": 7 }
+}
+```
+
+## Troubleshooting / notes
+- If new objects aren't invoking processing/analytics lambdas:
+  - Confirm EventBridge rules exist (`aws events list-rules` / Terraform state)
+  - Confirm `aws_cloudwatch_event_target` entries exist and targets show the Lambda ARN
+  - Confirm Lambda permissions allow `events.amazonaws.com` to invoke the function (`aws lambda get-policy --function-name <name>`)
+  - If S3 notifications were previously created for the same bucket with Terraform, they were removed in favor of EventBridge in this session to avoid overwrite conflicts.
+
+- Deprecation warnings: some Terraform config used `acl` on `aws_s3_bucket` and `aws_s3_bucket_object` (older resource names). These are warnings and not blocking here; consider upgrading to `aws_s3_object` and `aws_s3_bucket_acl` in a follow-up.
+
+## Next steps I can take for you
+1. Re-run `terraform apply` and finish EventBridge provisioning after you refresh AWS credentials in this environment. Then I'll trigger ingestion and verify analytics objects appear in the analytics bucket (I can do this for you and report the output).
+2. Add CI automation to package and deploy the Lambda zips and run a smoke test (would add a `Makefile` or GitHub Action).
+3. Expand analytics lambda to run time-windowed aggregation and persist results to DynamoDB or Redshift (design + implementation is available if you want it).
+
+## Short completion summary
+
+What changed: Terraform modules were made EventBridge-friendly (removing per-module S3 notifications), EventBridge rules and targets were added, ingestion handler fixed to support DB S3 download, and a public Chinook DB was uploaded to the raw bucket to test ingestion.
+
+What still needs your action: refresh valid AWS credentials in the dev environment so the final Terraform apply can complete and EventBridge can be validated end-to-end. Once that is done I will finish the apply and perform live verification.
+
+---
+If you'd like, I can now (A) wait for you to refresh credentials and then finish the apply & verification, (B) produce a downloadable `.docx` of this report, or (C) open a PR with the Terraform changes and notes. Tell me which next step you prefer.
 # Session Report — aws-automated-data-pipeline-iac
 
 ## Pipeline Goals

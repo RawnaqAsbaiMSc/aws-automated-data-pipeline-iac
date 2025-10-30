@@ -36,7 +36,8 @@ data "aws_iam_policy_document" "this" {
     for_each = var.attach_bucket_arns
     content {
       actions   = ["s3:PutObject", "s3:GetObject", "s3:ListBucket"]
-      resources = [statement.value]
+      # Allow access to the bucket itself and all objects under it
+      resources = [statement.value, "${statement.value}/*"]
     }
   }
 }
@@ -89,25 +90,12 @@ locals {
 }
 
 # Allow S3 to invoke the Lambda
-resource "aws_lambda_permission" "allow_s3" {
-  statement_id  = "AllowS3Invoke${var.name}"
+resource "aws_lambda_permission" "allow_invoke" {
+  statement_id  = "AllowInvoke${var.name}"
   action        = "lambda:InvokeFunction"
   function_name = local.lambda_name
-  principal     = "s3.amazonaws.com"
-  source_arn    = "arn:aws:s3:::${var.source_bucket}"
-}
-
-# Configure the bucket notification to invoke the lambda for events
-resource "aws_s3_bucket_notification" "this" {
-  bucket = var.source_bucket
-
-  lambda_function {
-    lambda_function_arn = local.lambda_arn
-    events              = var.events
-    filter_prefix       = var.filter_prefix
-    filter_suffix       = var.filter_suffix
-  }
-
-  depends_on = [aws_lambda_permission.allow_s3]
+  principal     = var.invoke_principal
+  # If an explicit invoke_source_arn is provided use it, otherwise fall back to the S3 bucket ARN
+  source_arn    = var.invoke_source_arn != "" ? var.invoke_source_arn : "arn:aws:s3:::${var.source_bucket}"
 }
 

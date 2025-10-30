@@ -72,6 +72,16 @@ variable "attach_bucket_arns" {
   default = []
 }
 
+variable "invoke_principal" {
+  type    = string
+  default = "s3.amazonaws.com"
+}
+
+variable "invoke_source_arn" {
+  type    = string
+  default = ""
+}
+
 variable "memory_size" {
   type    = number
   default = 256
