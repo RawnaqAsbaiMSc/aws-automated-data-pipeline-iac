@@ -509,3 +509,65 @@ I'll update this `REPORT.md` each time I run Terraform so it always reflects the
 - Tear down the infrastructure (`terraform destroy`) to avoid charges.
 
 Tell me which follow-up you want and I'll update the report again after completing it.
+
+## Test run — end-to-end validation (performed in session)
+
+During the session I ran a short end-to-end validation after the Terraform changes and IAM fixes so the processing Lambda could write analytics output. Below are the exact commands I ran and the representative outputs captured.
+
+1) Trigger ingestion (CLI invocation)
+
+```
+aws lambda invoke --function-name my-pipeline-ingestion --payload '{}' /tmp/ingest_test_out.json --cli-binary-format raw-in-base64-out
+cat /tmp/ingest_test_out.json
+```
+
+Observed output (ingestion):
+
+```
+{ "status": "ok", "s3_path": "s3://my-pipeline-raw-data-bdbdeadb/raw/2025-10-28T17-32-55Z/<uuid>.json", "row_count": 500 }
+```
+
+2) Trigger processing (synthetic S3-style event pointing at the generated raw object)
+
+```
+aws lambda invoke --function-name my-pipeline-processing --payload fileb:///tmp/process_event.json /tmp/process_out.json --cli-binary-format raw-in-base64-out
+cat /tmp/process_out.json
+```
+
+Observed output (processing) — after fixing analytics bucket PutObject permission via Terraform:
+
+```
+{ "status": "ok", "results": [ { "input": "s3://my-pipeline-raw-data-bdbdeadb/raw/2025-10-28T17-32-55Z/<uuid>.json", "output": "s3://my-pipeline-analytics-data-bdbdeadb/analytics/2025-10-30T11-35-22Z/a84a4f34-...json", "rows_processed": 500 } ] }
+```
+
+3) Verify analytics object exists and download a sample
+
+```
+aws s3 ls s3://my-pipeline-analytics-data-bdbdeadb --recursive
+aws s3 cp s3://my-pipeline-analytics-data-bdbdeadb/analytics/2025-10-30T11-35-22Z/a84a4f34-...json /tmp/latest_analytics.json
+head -n 80 /tmp/latest_analytics.json
+```
+
+Representative analytics JSON (trimmed):
+
+```
+{
+  "generated_from": "s3://my-pipeline-raw-data-bdbdeadb/raw/2025-10-28T17-32-55Z/<uuid>.json",
+  "album_counts": {
+    "For Those About To Rock (We Salute You)": 5,
+    "Back In Black": 7,
+    "...": "..."
+  },
+  "processed_at": "2025-10-30T11:35:22Z",
+  "processed_object": "s3://my-pipeline-processed-data-bdbdeadb/processed/2025-10-30T11-35-22Z/<uuid>.json"
+}
+```
+
+Notes:
+- The ingestion invocation returned 500 rows (the Chinook sample DB contains 500 track rows) and wrote a raw JSON into the raw bucket.
+- The processing invocation initially failed with AccessDenied when writing to the analytics bucket. I updated the Terraform module inputs to include the analytics bucket ARN in the set of bucket ARNs granted to the processing role (`attach_bucket_arns`) and re-ran `terraform apply`. After this change processing succeeded and the analytics JSON appeared in the analytics bucket.
+- The commands above were executed from the dev container where this repository is mounted. If you want, I can append the full downloaded analytics JSON to this report or add it as a separate file under `build/` (it's ~80KB).
+
+---
+
+If you'd like me to commit this updated report and regenerate `REPORT.docx` (I can run `python3 scripts/convert_report.py`), say "yes, update report and docx" and I'll push the updates and the generated DOCX to the repo.
